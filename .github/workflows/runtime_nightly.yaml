@@ -3,14 +3,19 @@ name: Multipy runtime nightly release
 on:
   schedule:
     - cron: '0 2 * * *' # run at 2 AM UTC
+  pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   unittest:
     strategy:
       matrix:
         python-version: [3.8]
-        platform: [linux.2xlarge]
+        platform: [linux.2xlarge, linux.4xlarge]
         abi: [0,1]
+        cuda: [0,1]
       fail-fast: false
     runs-on: ${{ matrix.platform }}
     steps:
@@ -27,6 +32,7 @@ jobs:
 
       - name: setup Path
         run: |
+          echo /usr/local/cuda-11.3/bin >> $GITHUB_PATH
           echo "/home/ec2-user/miniconda/bin" >> $GITHUB_PATH
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
 
@@ -42,14 +48,42 @@ jobs:
 
       - name: Install C++ toolchain
         run: |
-              sudo yum -y install clang llvm
-              export CC=clang
-              export CXX=clang++
+              if [[ ${{ matrix.abi }} == 0 ]]
+              then
+                wget http://mirror.centos.org/centos/7/extras/x86_64/Packages/centos-release-scl-2-3.el7.centos.noarch.rpm
+                wget http://mirror.centos.org/centos/7/extras/x86_64/Packages/centos-release-scl-rh-2-3.el7.centos.noarch.rpm
+                sudo rpm -ivh centos-release-scl-rh-2-3.el7.centos.noarch.rpm
+                sudo rpm -ivh centos-release-scl-2-3.el7.centos.noarch.rpm
+                yum repolist
+                sudo yum -y install centos-release-scl
+                sudo yum-config-manager --enable rhel-server-rhscl-7-rpms
+                sudo yum -y install devtoolset-7 --skip-broken
+                scl enable devtoolset-7 bash
+              else
+                sudo yum -y install clang llvm
+                export CC=clang
+                export CXX=clang++
+              fi
+
               sudo yum -y install xz-devel bzip2-devel libnsl2-devel readline-devel expat-devel gdbm-devel glibc-devel gmp-devel libffi-devel libGL-devel libX11-devel ncurses-devel openssl-devel sqlite-devel tcl-devel tix-devel tk-devel
               sudo yum -y install lzma
               sudo yum -y install uuid
               sudo yum -y install openmpi-devel
               sudo yum -y install zlib-devel
+
+      - name: Install CUDA 11.3
+        shell: bash
+        run: |
+              if [[ ${{ matrix.abi }} == 0 ]]
+              then
+                sudo yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+                sudo yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo
+                sudo yum clean expire-cache
+                sudo yum install -y nvidia-driver-latest-dkms
+                sudo yum install -y cuda-11-3
+                sudo yum install -y cuda-drivers
+                sudo yum install -y libcudnn8-devel
+              fi
 
       - name: create conda env
         run: |
@@ -75,7 +109,7 @@ jobs:
             conda run -n example_env python -m pip install torch torchvision torchaudio pathlib
             conda run -n example_env python generate_examples.py
 
-      - name: Build pytorch with ABI=${{ matrix.abi }}
+      - name: Build pytorch with ABI=${{ matrix.abi }} and USE_CUDA=${{ matrix.cuda }}
         shell: bash -l {0}
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
@@ -85,9 +119,10 @@ jobs:
               export TORCH_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=${{ matrix.abi }}"
               cd multipy/runtime/third-party/pytorch
               export USE_DEPLOY=1
+              export USE_CUDA=${{ matrix.cuda }}
               conda run -n multipy_runtime_env python setup.py develop
 
-      - name: Build multipy runtime with ABI=${{ matrix.abi }}
+      - name: Build multipy runtime
         shell: bash -l {0}
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
@@ -98,7 +133,7 @@ jobs:
               conda run -n multipy_runtime_env cmake -DABI_EQUALS_1=${{ matrix.abi }} ..
               conda run -n multipy_runtime_env cmake --build . --config Release
 
-      - name: install files
+      - name: Install files
         shell: bash -l {0}
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
@@ -106,13 +141,24 @@ jobs:
               cd multipy/runtime/build
               conda run -n multipy_runtime_env cmake --install . --prefix "."
 
-      - name: Run unit tests with ABI=${{ matrix.abi }}
+      - name: Run unit tests with ABI=${{ matrix.abi }} with cuda=${{ matrix.cuda }}
         shell: bash -l {0}
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
               cd multipy/runtime/build
               ./test_deploy
+
+      - name: Run unit tests with ABI=${{ matrix.abi }} with gpu
+        shell: bash -l {0}
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+              if [[ ${{ matrix.cuda }} -eq 1 ]]
+              then
+              cd multipy/runtime/build
+              ./test_deploy_gpu
+              fi
 
       - name: create tarball [click me to get a list of files for the nightly release]
         shell: bash -l {0}
@@ -125,7 +171,7 @@ jobs:
       - name: Update nightly release
         uses: pyTooling/Actions/releaser@main
         with:
-          tag: nightly-runtime-abi-${{ matrix.abi }}
+          tag: nightly-runtime-abi-${{ matrix.abi }}-cuda-${{matrix.cuda}}
           rm: true
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
